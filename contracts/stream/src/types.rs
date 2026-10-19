@@ -1,7 +1,7 @@
 use soroban_sdk::{contracttype, Address, String};
 
 /// Maximum length for stream reference strings.
-/// 
+///
 /// This limit balances utility with storage costs. References are intended for
 /// short identifiers like "payroll-001" or "grant-xyz-q1-2024".
 pub const MAX_REFERENCE_LENGTH: u32 = 64;
@@ -242,6 +242,17 @@ pub struct Stream {
     /// an earlier deployment keeps decoding — see [`StreamRecord`] for why
     /// appending a field to the stored value is not an option.
     pub curve: ReleaseCurve,
+    /// Optional reference string for stream identification.
+    ///
+    /// Set at creation and never mutable. Maximum length is
+    /// [`MAX_REFERENCE_LENGTH`] characters. Intended for short identifiers
+    /// like "payroll-001" or "grant-xyz-q1-2024" to help operators distinguish
+    /// between streams on-chain.
+    ///
+    /// Like `curve`, this is **not** part of the frozen v1 stored encoding:
+    /// the record below carries the v1 field set, so a stream read back from an
+    /// entry written before references existed has none.
+    pub reference: Option<String>,
 }
 
 /// The **stored** form of a stream: the frozen v1 layout, without `curve`.
@@ -272,13 +283,15 @@ pub struct StreamRecord {
     pub token: Address,
     pub deposited: i128,
     pub withdrawn: i128,
-    /// Optional reference string for stream identification.
-    /// 
-    /// Set at creation and never mutable. Maximum length is
-    /// [`MAX_REFERENCE_LENGTH`] characters. Intended for short identifiers
-    /// like "payroll-001" or "grant-xyz-q1-2024" to help operators distinguish
-    /// between streams on-chain.
-    pub reference: Option<String>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub cliff_time: u64,
+    pub cancellable: bool,
+    pub pausable: bool,
+    pub transferable: bool,
+    pub paused_at: Option<u64>,
+    pub paused_total: u64,
+    pub status: StreamStatus,
 }
 
 /// One element in an atomic payroll-style stream creation batch.
@@ -294,9 +307,6 @@ pub struct BatchCreateRequest {
     pub cancellable: bool,
     pub pausable: bool,
     pub transferable: bool,
-    pub paused_at: Option<u64>,
-    pub paused_total: u64,
-    pub status: StreamStatus,
 }
 
 impl StreamRecord {
@@ -337,7 +347,11 @@ impl StreamRecord {
             paused_at: self.paused_at,
             paused_total: self.paused_total,
             status: self.status,
+            // Neither of these is part of the frozen v1 record, so a stream
+            // decoded from storage takes the pre-feature defaults.
+            cliff_mode: CliffMode::DEFAULT,
             curve,
+            reference: None,
         }
     }
 }
@@ -358,6 +372,60 @@ impl Stream {
     pub fn require_recipient_auth(&self) {
         self.recipient.require_auth();
     }
+}
+
+/// Total basis points that share allocations must sum to.
+///
+/// 10_000 bp = 100 %. Every `create_stream_split` call validates that the
+/// supplied shares sum exactly to this value.
+pub const TOTAL_BPS: u32 = 10_000;
+
+/// Maximum number of recipients in a single split stream.
+///
+/// Kept small to bound the footprint of `withdraw_share` (one
+/// `StreamShares` read + one `Stream` read = 2 persistent entries, independent
+/// of the number of other shares), and to stay within the Soroban per-call
+/// instruction budget when iterating over all shares during validation.
+pub const MAX_SPLIT_RECIPIENTS: u32 = 8;
+
+/// One recipient's allocation in a split stream.
+///
+/// Stored inside [`StreamShares`] alongside a per-recipient `withdrawn` counter
+/// that mirrors the stream-level `withdrawn` but tracks only this recipient's
+/// draw-downs. The rest of the accounting (deposited, vested, refundable) is
+/// computed on the fly from the parent stream's fields and the share's `bps`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareEntry {
+    /// The address that may call `withdraw_share` for this slice.
+    pub recipient: Address,
+    /// Allocation in basis points (1 bp = 0.01 %). Must be in `[1, 9999]`;
+    /// the whole set must sum to [`TOTAL_BPS`].
+    pub bps: u32,
+    /// Tokens already withdrawn by this recipient, in the token's smallest
+    /// unit. Starts at zero and only ever grows. Never exceeds the recipient's
+    /// share of the stream's vested total.
+    pub withdrawn: i128,
+}
+
+/// The complete set of share allocations for a split stream.
+///
+/// Stored in persistent storage under [`DataKey::StreamShares`], beside the
+/// [`crate::types::StreamRecord`] that carries the common schedule. The entry
+/// exists if and only if the stream was created with
+/// [`crate::FluxoraStream::create_stream_split`]; a plain stream has no shares
+/// entry and `withdraw_share` will return [`crate::error::Error::StreamNotSplit`].
+///
+/// The shares are ordered by creation order and that order is meaningful:
+/// integer-division rounding dust (the handful of stroops lost when
+/// `deposited * bps / TOTAL_BPS` does not divide evenly) is always credited to
+/// **the first share**. That makes the rounding party deterministic and
+/// auditable at creation time: whoever holds index 0 gets any residue.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamShares {
+    /// Ordered list of share allocations. Length is in `[2, MAX_SPLIT_RECIPIENTS]`.
+    pub shares: soroban_sdk::Vec<ShareEntry>,
 }
 
 /// Storage keys.
@@ -413,4 +481,10 @@ pub enum DataKey {
     /// Instance storage. Unix seconds at which the halt was engaged; present
     /// if and only if the contract is halted.
     HaltedAt,
+    /// Persistent storage. Share allocations for a split stream.
+    ///
+    /// Present if and only if the stream was created with
+    /// [`crate::FluxoraStream::create_stream_split`]. A plain single-recipient
+    /// stream has no entry here. The TTL mirrors the parent stream entry.
+    StreamShares(u64),
 }

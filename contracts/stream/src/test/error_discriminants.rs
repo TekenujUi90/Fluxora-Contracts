@@ -99,22 +99,30 @@ pub(super) const DISCRIMINANT_FIXTURE: &[(&str, u32)] = &[
     ("TokenAmountMismatch", 32),
     // --- Vesting monotonicity ---
     ("VestedDecreased", 33),
-    // --- Rebase detection ---
-    ("PoolBalanceDrift", 34),
     // --- Contract-level emergency halt (#1818) ---
     ("ContractHalted", 34),
     ("HaltOperatorAlreadySet", 35),
     ("HaltOperatorNotSet", 36),
     ("ContractAlreadyHalted", 37),
     ("ContractNotHalted", 38),
+    // --- Rebase detection ---
+    ("PoolBalanceDrift", 39),
+    // --- Reference validation ---
+    ("InvalidReferenceLength", 40),
+    // --- Factory policy ---
+    ("FactoryPaused", 41),
+    ("DepositExceedsCap", 42),
+    ("DurationBelowMinimum", 43),
+    ("TokenNotAllowlisted", 44),
+    ("RateBelowMin", 45),
+    ("RateAboveMax", 46),
 ];
 
 /// The highest discriminant value in the fixture above.
 ///
 /// New variants must use `LAST_DISCRIMINANT + 1`. This constant is checked
 /// against the fixture length so a gap is caught immediately.
-const LAST_DISCRIMINANT: u32 = 34;
-const LAST_DISCRIMINANT: u32 = 38;
+const LAST_DISCRIMINANT: u32 = 46;
 
 /// Assert that the fixture has no gaps and ends at `LAST_DISCRIMINANT`.
 ///
@@ -420,6 +428,7 @@ fn invalid_time_range_end_equals_start() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -450,6 +459,7 @@ fn invalid_cliff_before_start() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -480,6 +490,7 @@ fn invalid_deposit_zero() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -511,6 +522,7 @@ fn deposit_rate_too_low_below_floor() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -541,6 +553,7 @@ fn self_stream_same_sender_and_recipient() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -959,6 +972,7 @@ fn overflow_deposit_times_duration_overflows_i128() {
             &true,
             &true,
             &true,
+            &None,
         )
         .unwrap_err()
         .unwrap();
@@ -1185,7 +1199,7 @@ fn vested_decreased_discriminant_value() {
     );
 }
 
-// #34 — PoolBalanceDrift ----------------------------------------------------
+// #39 — PoolBalanceDrift ----------------------------------------------------
 //
 // Issue #1805. Driven end-to-end (a rebasing token desynchronising the pool,
 // detected on the next `withdraw`, `top_up` or `cancel`) in `test::rebase_drift`,
@@ -1197,7 +1211,10 @@ fn pool_balance_drift_discriminant_value() {
     assert_eq!(
         Error::PoolBalanceDrift as u32,
         34,
-        "PoolBalanceDrift discriminant must be 34",
+        "PoolBalanceDrift discriminant must be 39",
+    );
+}
+
 // #34–#38 — contract-level emergency halt (#1818) ---------------------------
 //
 // Driven end-to-end from the public ABI in `test::halt`, which halts a live

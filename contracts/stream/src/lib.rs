@@ -43,6 +43,11 @@
 //! admin rotation and nothing user-configurable in storage. Immutability is
 //! what lets another protocol depend on this one.
 //!
+//! **Upgrade posture: the contract is immutable.** There is no `upgrade`
+//! entry point, no admin, and no storage slot that could authorise replacing
+//! the deployed WASM. See `docs/ABI.md` "Upgrade posture" and
+//! `docs/MIGRATION.md` for the consequences.
+//!
 //! ## The single operator: an opt-in emergency halt (#1818)
 //!
 //! The one exception is the contract-level emergency stop. An operator can be
@@ -85,12 +90,14 @@ compile_error!("Fluxora production WASM must not enable the testutils feature.")
 extern crate std;
 
 mod accrual;
-#[cfg(test)]
-mod protocol_limits;
 mod error;
 mod events;
+#[cfg(test)]
+mod protocol_limits;
 mod storage;
 mod types;
+#[cfg(test)]
+mod protocol_limits;
 
 pub use accrual::{
     cliff_reached, duration, elapsed, liability, refundable, stream_time, vested, withdrawable,
@@ -100,15 +107,38 @@ pub use storage::{
     MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS, TTL_SAFETY_MARGIN_PERCENT,
 };
 pub use types::op;
-pub use types::{DataKey, DelegateGrant, ReleaseCurve, Stream, StreamStatus};
-pub use types::{BatchCreateRequest, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{BatchCancelOutcome, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{CliffMode, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{DataKey, DelegateGrant, Stream, StreamStatus, MAX_REFERENCE_LENGTH};
+pub use types::{
+    BatchCancelOutcome, BatchCreateRequest, CliffMode, DataKey, DelegateGrant, ReleaseCurve,
+    Stream, StreamStatus, MAX_REFERENCE_LENGTH,
+};
 
 use soroban_sdk::{
-    contract, contractimpl, token, Address, Env, InvokeError, MuxedAddress, TryFromVal, Vec,
+    contract, contractimpl, contracttype, token, Address, Env, InvokeError, MuxedAddress, String,
+    TryFromVal, Vec,
 };
+
+/// Mirror of `fluxora_factory::FactoryConfig`, used to decode the return value
+/// of a cross-contract call to `FluxoraFactory::get_factory_config`.
+///
+/// `#[contracttype]` encodes structs as XDR maps keyed by field name, so this
+/// decodes correctly as long as the field names and types match the factory's
+/// definition — which they do, and `test::factory_policy_enforcement` verifies
+/// the round-trip end-to-end.
+///
+/// This type is intentionally private to this module: it is only ever produced
+/// by deserialising a factory response, never constructed directly.
+#[contracttype]
+#[derive(Clone)]
+struct FactoryConfig {
+    pub admin: Address,
+    pub stream_contract: Address,
+    pub max_deposit: i128,
+    pub min_duration: u64,
+    pub batch_cap_enforced: bool,
+    pub creation_paused: bool,
+    pub min_rate_per_second: Option<i128>,
+    pub max_rate_per_second: Option<i128>,
+}
 
 /// Maximum number of streams one batch call may touch.
 ///
@@ -157,6 +187,11 @@ pub const MAX_BATCH_SIZE: u32 = 16;
 /// The on-chain contract is immutable, so a bump is a *new deployment*, not an
 /// in-place upgrade. See `docs/ABI.md` and `test::abi`.
 ///
+/// Immutability is deliberate: the contract exposes no upgrade entry point,
+/// so a version bump can only ever ship as a fresh deployment with a new
+/// contract id. See `docs/MIGRATION.md` for the migration path that follows
+/// from that.
+///
 /// **2** — [`ReleaseCurve`] support. `get_stream`'s `Stream` return type grew a
 /// `curve` field and `StreamCreated` grew a `curve` payload, so a typed client
 /// built against version 1 cannot decode either. The new
@@ -177,6 +212,28 @@ pub const MAX_BATCH_SIZE: u32 = 16;
 /// readers and indexers decode it from storage or an event, both of which carry
 /// the new field explicitly.
 pub const ABI_VERSION: u32 = 2;
+
+/// Whether the deployed contract can be replaced in place.
+///
+/// **`false`, deliberately.** This constant exists so the posture is stated
+/// in the ABI itself rather than only in prose: an integrator can read it
+/// on-chain, and `test::abi` asserts it matches the absence of any upgrade
+/// entry point.
+///
+/// # Consequences
+///
+/// * **No upgrade entry point.** The contract exposes no `upgrade`,
+///   `set_admin`, or `migrate` method, and no storage key holds a WASM hash
+///   or an admin address. `test::abi` fails if one is ever added without
+///   flipping this constant and updating `docs/ABI.md`.
+/// * **A new ABI version is a new deployment.** [`ABI_VERSION`] bumps ship
+///   as a fresh contract id; existing streams stay on the old contract and
+///   must be drained or cancelled there. `docs/MIGRATION.md` describes that
+///   path.
+/// * **The halt operator is not an upgrade path.** It can stop settlement
+///   ([`FluxoraStream::halt`]) but cannot change code, storage layout, or
+///   any stream's terms.
+pub const UPGRADEABLE: bool = false;
 
 /// Call `token.transfer(from, to, amount)` and map any failure to a stable
 /// stream-level error.
@@ -363,6 +420,7 @@ impl FluxoraStream {
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
     ) -> Result<u64, Error> {
         Self::create_stream_with_cliff_mode(
             env,
@@ -377,6 +435,7 @@ impl FluxoraStream {
             cancellable,
             pausable,
             transferable,
+            reference,
         )
     }
 
@@ -488,7 +547,7 @@ impl FluxoraStream {
     ) -> Result<u64, Error> {
         sender.require_auth();
 
-        Self::create_stream_unchecked(
+        Self::create_stream_inner(
             env,
             sender,
             recipient,
@@ -497,9 +556,12 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            cliff_mode,
             cancellable,
             pausable,
             transferable,
+            reference,
+            ReleaseCurve::Linear,
         )
     }
 
@@ -513,9 +575,11 @@ impl FluxoraStream {
         start_time: u64,
         end_time: u64,
         cliff_time: u64,
+        cliff_mode: CliffMode,
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
     ) -> Result<u64, Error> {
         Self::create_stream_inner(
             env,
@@ -526,9 +590,11 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            cliff_mode,
             cancellable,
             pausable,
             transferable,
+            reference,
             ReleaseCurve::Linear,
         )
     }
@@ -597,9 +663,11 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            CliffMode::DEFAULT,
             cancellable,
             pausable,
             transferable,
+            None,
             curve,
         )
     }
@@ -621,9 +689,11 @@ impl FluxoraStream {
         start_time: u64,
         end_time: u64,
         cliff_time: u64,
+        cliff_mode: CliffMode,
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
         curve: ReleaseCurve,
     ) -> Result<u64, Error> {
         // Emergency halt (#1818): refuse state changes before anything else.
@@ -645,7 +715,7 @@ impl FluxoraStream {
 
         // Validate reference length if provided
         if let Some(ref r) = reference {
-            if r.len() > MAX_REFERENCE_LENGTH as usize {
+            if r.len() > MAX_REFERENCE_LENGTH {
                 return Err(Error::InvalidReferenceLength);
             }
         }
@@ -758,12 +828,149 @@ impl FluxoraStream {
                 request.start_time,
                 request.end_time,
                 request.cliff_time,
+                CliffMode::DEFAULT,
                 request.cancellable,
                 request.pausable,
                 request.transferable,
+                None,
             )?);
         }
         Ok(ids)
+    }
+
+    /// Create a stream enforcing the policy of a deployed [`FluxoraFactory`].
+    ///
+    /// Identical to [`create_stream`](Self::create_stream) in every respect
+    /// except that it first loads the factory's policy via a cross-contract
+    /// call and validates the request against all configured constraints before
+    /// creating the stream:
+    ///
+    /// * **Pause check** — if the factory's creation pause is on, the call
+    ///   returns [`Error::FactoryPaused`] immediately.
+    /// * **Deposit cap** — `deposit` must not exceed `policy.max_deposit`;
+    ///   excess returns [`Error::DepositExceedsCap`].
+    /// * **Duration floor** — `end_time - start_time` must be at least
+    ///   `policy.min_duration`; a shorter schedule returns
+    ///   [`Error::DurationBelowMinimum`].
+    /// * **Token allowlist** — the `token` must be allowlisted on the factory;
+    ///   an absent entry returns [`Error::TokenNotAllowlisted`].
+    /// * **Rate bounds** — if set, the per-second rate (`deposit / duration`)
+    ///   must lie within `[min_rate_per_second, max_rate_per_second]`; a rate
+    ///   outside the interval returns [`Error::RateBelowMin`] or
+    ///   [`Error::RateAboveMax`].
+    ///
+    /// All other validation (self-stream, dust rate, overflow guard, etc.) is
+    /// identical to [`create_stream`](Self::create_stream).
+    ///
+    /// # Authorization
+    ///
+    /// Requires `sender`'s auth, exactly as [`create_stream`](Self::create_stream).
+    /// No factory-admin auth is needed; the factory contract itself is read
+    /// via permissionless view calls.
+    ///
+    /// # Errors
+    ///
+    /// All errors from [`create_stream`](Self::create_stream) plus:
+    /// * [`Error::FactoryPaused`]
+    /// * [`Error::DepositExceedsCap`]
+    /// * [`Error::DurationBelowMinimum`]
+    /// * [`Error::TokenNotAllowlisted`]
+    /// * [`Error::RateBelowMin`]
+    /// * [`Error::RateAboveMax`]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream_via_factory(
+        env: Env,
+        factory: Address,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, Error> {
+        // Load policy from the factory contract via cross-contract calls.
+        // `get_factory_config` and `is_allowlisted` are permissionless read
+        // views — no auth is required or consumed.
+        use soroban_sdk::Symbol;
+
+        // Fetch the full config in one call.
+        let config: FactoryConfig = env.invoke_contract(
+            &factory,
+            &Symbol::new(&env, "get_factory_config"),
+            soroban_sdk::vec![&env],
+        );
+
+        // 1. Pause check — refuse first, before any other work.
+        if config.creation_paused {
+            return Err(Error::FactoryPaused);
+        }
+
+        // 2. Deposit cap.
+        if deposit > config.max_deposit {
+            return Err(Error::DepositExceedsCap);
+        }
+
+        // 3. Duration floor — validate time range first so the subtraction
+        //    cannot underflow (end_time > start_time is checked inside
+        //    create_stream_inner, but we need the duration here).
+        if end_time <= start_time {
+            // Let create_stream_inner produce the proper InvalidTimeRange error.
+        } else {
+            let duration = end_time - start_time;
+            if duration < config.min_duration {
+                return Err(Error::DurationBelowMinimum);
+            }
+
+            // 4. Rate bounds — rate = deposit / duration (integer floor).
+            //    deposit <= 0 is caught by create_stream_inner; a non-positive
+            //    deposit here simply skips the check, letting the inner path
+            //    produce InvalidDeposit.
+            if deposit > 0 {
+                let rate = deposit / duration as i128;
+                if let Some(min_rate) = config.min_rate_per_second {
+                    if rate < min_rate {
+                        return Err(Error::RateBelowMin);
+                    }
+                }
+                if let Some(max_rate) = config.max_rate_per_second {
+                    if rate > max_rate {
+                        return Err(Error::RateAboveMax);
+                    }
+                }
+            }
+        }
+
+        // 5. Token allowlist.
+        let allowlisted: bool = env.invoke_contract(
+            &factory,
+            &Symbol::new(&env, "is_allowlisted"),
+            soroban_sdk::vec![&env, token.to_val()],
+        );
+        if !allowlisted {
+            return Err(Error::TokenNotAllowlisted);
+        }
+
+        // All policy checks passed — create the stream normally.
+        Self::create_stream_inner(
+            env,
+            sender,
+            recipient,
+            token,
+            deposit,
+            start_time,
+            end_time,
+            cliff_time,
+            CliffMode::DEFAULT,
+            cancellable,
+            pausable,
+            transferable,
+            None, // reference
+            ReleaseCurve::Linear,
+        )
     }
 
     /// Add funds to a live stream.
@@ -1378,6 +1585,42 @@ impl FluxoraStream {
         debug_assert_eq!(stream.deposited, vested_now);
         events::cancelled(env, stream_id, stream, refund);
         Ok(())
+    }
+
+    /// Recover sender-owned rounding dust after the recipient's claim is settled.
+    ///
+    /// The sender owns any integer-token residue left by rounding. Recovery is
+    /// available after a stream becomes terminal and transfers only the
+    /// refundable portion of its outstanding liability. Any amount still
+    /// withdrawable by the recipient remains reserved for them.
+    pub fn reclaim_dust(env: Env, stream_id: u64) -> Result<i128, Error> {
+        let mut stream = storage::load_stream(&env, stream_id)?;
+        stream.sender.require_auth();
+        if !stream.status.is_terminal() {
+            return Ok(0);
+        }
+
+        let now = env.ledger().timestamp();
+        let liability = accrual::liability(&stream)?;
+        let recipient_claim = accrual::withdrawable(&stream, now)?;
+        let amount = liability
+            .checked_sub(recipient_claim)
+            .ok_or(Error::Overflow)?;
+        if amount > 0 {
+            stream.deposited = stream
+                .deposited
+                .checked_sub(amount)
+                .ok_or(Error::Overflow)?;
+            storage::save_stream(&env, stream_id, &stream);
+            token_transfer(
+                &env,
+                &stream.token,
+                &env.current_contract_address(),
+                MuxedAddress::from(stream.sender.clone()),
+                &amount,
+            )?;
+        }
+        Ok(amount)
     }
 
     /// Pause accrual. Only the sender, and only if `pausable`.
@@ -2228,6 +2471,16 @@ impl FluxoraStream {
     /// of the emergency stop entirely.
     pub fn halt_operator(env: Env) -> Option<Address> {
         storage::halt_operator(&env)
+    }
+
+    /// Whether the deployed contract can be replaced in place.
+    ///
+    /// Always `false` — this is the on-chain statement of the upgrade
+    /// posture documented in `docs/ABI.md` and `docs/MIGRATION.md`. It is a
+    /// constant, not a storage read, so it answers even before any stream
+    /// exists and cannot be changed by the halt operator or anyone else.
+    pub fn upgradeable(_env: Env) -> bool {
+        UPGRADEABLE
     }
 
     // ---------------------------------------------------------------------
